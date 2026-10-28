@@ -35,7 +35,6 @@ pandas>=2.0.0
 ollama==0.6.0
 orjson==3.11.3
 ormsgpack==1.10.0
-packaging==25.0
 propcache==0.4.0
 pydantic==2.11.10
 pydantic-settings==2.11.0
@@ -68,7 +67,7 @@ tavily-python==0.3.3
 beautifulsoup4==4.12.3
 
 # Sigma Rules
-pysigma>=0.11.0
+pysigma>=0.11.0,<1.0
 pysigma-backend-splunk>=1.0.0
 pysigma-pipeline-sysmon>=1.0.0
 

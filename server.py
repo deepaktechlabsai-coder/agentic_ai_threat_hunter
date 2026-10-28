@@ -862,7 +862,7 @@ async def ws_chat(websocket: WebSocket):
                                 "detail": "Planning complete",
                                 "status": "done",
                             }))
-                        elif node_name in ["ThreatIntel", "Hunter", "RedTeam", "Detection"]:
+                        elif node_name in ["ThreatIntel", "Hunter", "RedTeam", "Detection", "Responder"]:
                             await websocket.send_json(_add_timestamp({
                                 "type": "activity", 
                                 "title": f"{node_name} Agent", 
@@ -872,53 +872,70 @@ async def ws_chat(websocket: WebSocket):
                 
                 # Check final state
                 snapshot = agent_graph.get_state(config)
-                if snapshot.next:
-                    # If there is a 'next' step, it means we were interrupted (HITL)
-                    # For RedTeam, this is expected.
+                denied = False
+
+                # Human-in-the-loop: the graph pauses BEFORE RedTeam and Responder.
+                # This is a loop so that more than one approval in a single request works.
+                while snapshot.next and snapshot.next[0] in ("RedTeam", "Responder"):
                     next_node = snapshot.next[0]
                     if next_node == "RedTeam":
+                        approval_detail = "Red Team Agent wants to execute an attack simulation."
+                    else:
+                        approval_detail = "Responder Agent wants to take a response action (block IP / isolate host / disable user)."
+
+                    await websocket.send_json(_add_timestamp({
+                        "type": "approval_required",
+                        "title": "Approval Required",
+                        "detail": approval_detail,
+                        "thread_id": thread_id,
+                        "next_node": next_node
+                    }))
+                    # We stop here and wait for a new WS message from client
+                    # In a real app, we'd store the state/thread_id in a DB.
+                    # Here, we keep the WS open and wait.
+
+                    # Wait for the user's decision (approve or deny)
+                    decision = None
+                    while decision is None:
+                        data = await websocket.receive_json()
+                        if data.get("type") in ("approve", "deny"):
+                            decision = data.get("type")
+
+                    if decision == "deny":
                         await websocket.send_json(_add_timestamp({
-                            "type": "approval_required",
-                            "title": "Approval Required",
-                            "detail": "Red Team Agent wants to execute an attack simulation.",
-                            "thread_id": thread_id,
-                            "next_node": "RedTeam"
+                            "type": "activity",
+                            "title": "Denied",
+                            "detail": "Action cancelled by user.",
+                            "status": "error",
+                            "icon": "x",
                         }))
-                        # We stop here and wait for a new WS message from client
-                        # In a real app, we'd store the state/thread_id in a DB.
-                        # Here, we keep the WS open and wait.
-                        
-                        # Loop to wait for approval
-                        while True:
-                            data = await websocket.receive_json()
-                            if data.get("type") == "approve":
+                        denied = True
+                        break
+
+                    await websocket.send_json(_add_timestamp({
+                        "type": "activity",
+                        "title": "Approved",
+                        "detail": "Resuming execution...",
+                        "status": "done",
+                        "icon": "check",
+                    }))
+                    # Resume graph - pass None to continue from interrupt
+                    async for chunk in agent_graph.astream(None, config=config):
+                        for node_name in chunk.keys():
+                            if node_name in ["ThreatIntel", "Hunter", "RedTeam", "Detection", "Responder"]:
                                 await websocket.send_json(_add_timestamp({
-                                    "type": "activity",
-                                    "title": "Approved",
-                                    "detail": "Resuming execution...",
-                                    "status": "done",
-                                    "icon": "check",
+                                    "type": "activity", 
+                                    "title": f"{node_name} Agent", 
+                                    "detail": "Task Completed", 
+                                    "status": "done"
                                 }))
-                                # Resume graph - pass None to continue from interrupt
-                                async for chunk in agent_graph.astream(None, config=config):
-                                    for node_name in chunk.keys():
-                                        if node_name in ["ThreatIntel", "Hunter", "RedTeam", "Detection"]:
-                                            await websocket.send_json(_add_timestamp({
-                                                "type": "activity", 
-                                                "title": f"{node_name} Agent", 
-                                                "detail": "Task Completed", 
-                                                "status": "done"
-                                            }))
-                                break
-                            elif data.get("type") == "deny":
-                                await websocket.send_json(_add_timestamp({
-                                    "type": "activity",
-                                    "title": "Denied",
-                                    "detail": "Action cancelled by user.",
-                                    "status": "error",
-                                    "icon": "x",
-                                }))
-                                return # Stop execution
+
+                    # Check again: the graph may pause for another approval
+                    snapshot = agent_graph.get_state(config)
+
+                if denied:
+                    # User denied. Keep the WebSocket open for the next question.
+                    continue
                 
                 # Final Result
                 snapshot = agent_graph.get_state(config)

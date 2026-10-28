@@ -1,64 +1,187 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import operator
-from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, TypedDict, Union
+import os
+import re
+from datetime import datetime
+from typing import Annotated, Any, Dict, Literal, Optional, Sequence, TypedDict
 
-from langchain_core.messages import BaseMessage, FunctionMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 # Import tools
 from tools.web_tools import web_search, visit_page
 from tools.atomic_red_team import AtomicRedTeamTool
 from tools.sigma_tool import SigmaTool
-from starlette.concurrency import run_in_threadpool
+from tools.virustotal_tool import check_virustotal as _vt_check
 
-# --- State Definition ---
+
+# =====================================================================
+# ZERO TRUST POLICY GATE
+# Every tool call is checked BEFORE it runs:
+#   1. Least privilege: each agent may use only its own tools
+#   2. Risk scoring: dangerous commands raise the score
+#   3. Decision: allow or deny (score >= DENY_THRESHOLD is denied)
+#   4. Audit log: every decision is written to audit_log.jsonl
+# =====================================================================
+
+AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
+DENY_THRESHOLD = int(os.getenv("POLICY_DENY_THRESHOLD", "80"))
+
+# Least privilege: which tools each agent is allowed to use
+AGENT_PERMISSIONS: Dict[str, set] = {
+    "ThreatIntel": {"web_search", "visit_page", "check_virustotal"},
+    "Hunter": {"execute_splunk_search", "run_velociraptor_query"},
+    "RedTeam": {"atomic_red_team"},
+    "Detection": {"sigma_rule"},
+    "Responder": {"block_ip", "isolate_host", "disable_user"},
+}
+
+# Base risk of each tool (0-100)
+TOOL_BASE_RISK: Dict[str, int] = {
+    "web_search": 5,
+    "visit_page": 10,
+    "check_virustotal": 5,
+    "sigma_rule": 5,
+    "execute_splunk_search": 15,
+    "run_velociraptor_query": 20,
+    "atomic_red_team": 50,
+    "block_ip": 60,
+    "isolate_host": 70,
+    "disable_user": 70,
+}
+
+# Dangerous SPL commands (they change or export data, or run code)
+DANGEROUS_SPL = re.compile(
+    r"\|\s*(delete|outputlookup|outputcsv|collect|sendemail|script|run|map|dbxquery|sendalert)\b",
+    re.IGNORECASE,
+)
+# Dangerous VQL functions (they run commands or change the endpoint)
+DANGEROUS_VQL = re.compile(
+    r"\b(execve|shell|powershell|cmd|hunt_add|collect_client|rm|kill|upload)\s*\(",
+    re.IGNORECASE,
+)
+
+PROTECTED_USERS = {"administrator", "root", "system", "admin", "localsystem"}
+
+
+def _audit(entry: Dict[str, Any]) -> None:
+    """Write one decision to the audit log. Never crash the agent if logging fails."""
+    try:
+        entry["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        print(f"Audit log write failed: {e}")
+
+
+def policy_check(agent: str, tool_name: str, payload: str) -> Dict[str, Any]:
+    """Zero trust decision for one tool call. Returns {decision, risk, reason}."""
+    payload = payload or ""
+    risk = TOOL_BASE_RISK.get(tool_name, 40)
+    reasons = []
+
+    # 1) Least privilege
+    allowed = AGENT_PERMISSIONS.get(agent, set())
+    if tool_name not in allowed:
+        result = {"decision": "deny", "risk": 100,
+                  "reason": f"{agent} is not allowed to use {tool_name} (least privilege)"}
+        _audit({"agent": agent, "tool": tool_name, "payload": payload[:300], **result})
+        return result
+
+    # 2) Risk scoring
+    if tool_name == "execute_splunk_search" and DANGEROUS_SPL.search(payload):
+        risk += 70
+        reasons.append("dangerous SPL command (delete/outputlookup/collect/script...)")
+    if tool_name == "run_velociraptor_query" and DANGEROUS_VQL.search(payload):
+        risk += 70
+        reasons.append("dangerous VQL function (execve/shell/powershell...)")
+
+    # 3) Decision
+    decision = "deny" if risk >= DENY_THRESHOLD else "allow"
+    result = {"decision": decision, "risk": min(risk, 100),
+              "reason": "; ".join(reasons) if reasons else "within policy"}
+    _audit({"agent": agent, "tool": tool_name, "payload": payload[:300], **result})
+    return result
+
+
+def _gated(agent: str, tool_name: str, fn, payload: str):
+    """Run fn(payload) only if the policy gate allows it."""
+    verdict = policy_check(agent, tool_name, payload)
+    if verdict["decision"] != "allow":
+        return f"POLICY DENIED (risk {verdict['risk']}): {verdict['reason']}. Do not retry this query. Use a safe read-only query instead."
+    return fn(payload)
+
+
+# =====================================================================
+# State
+# =====================================================================
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
     instructions: str
-    # Shared scratchpad for tool outputs (optional, if we want structured passing)
-    tool_output: Optional[Dict[str, Any]] 
+    tool_output: Optional[Dict[str, Any]]
 
-# --- Supervisor Node ---
+
+MAX_SUPERVISOR_STEPS = 10   # stops endless loops in hunt mode
+MAX_ADAPTIVE_RETRIES = 3    # how many times Hunter may retry a failed/empty query
+
+
+# =====================================================================
+# Supervisor
+# =====================================================================
 
 class SupervisorOutput(BaseModel):
     thought: str = Field(description="The reasoning behind the decision")
-    next_agent: Literal["ThreatIntel", "Hunter", "RedTeam", "Detection", "FINISH"] = Field(
+    next_agent: Literal["ThreatIntel", "Hunter", "RedTeam", "Detection", "Responder", "FINISH"] = Field(
         description="The next agent to act, or FINISH if the user's request is satisfied"
     )
     instructions_for_agent: str = Field(
         description="Specific instructions for the selected agent. If FINISH, provide the final answer."
     )
 
-def build_supervisor_node(model_name: str):
-    system_prompt = """You are the Supervisor (Manager) of a cybersecurity threat hunting team.
-Your goal is to orchestrate the following specialized agents to solve complex security tasks:
 
-1. **ThreatIntel**: Research external threats, CVEs, actor TTPs, and reputation (VirusTotal).
-2. **Hunter**: Search internal logs (Splunk) and endpoint state (Velociraptor). Use this for investigating specific indicators or hunting for activity.
-3. **RedTeam**: Execute Atomic Red Team tests to simulate attacks. **PRIORITY**: If the user mentions "simulate", "atomic", "T1003", or "attack", YOU MUST CHOOSE THIS AGENT.
+VALID_AGENTS = ["ThreatIntel", "Hunter", "RedTeam", "Detection", "Responder", "FINISH"]
+
+
+def build_supervisor_node(model_name: str):
+    system_prompt = """You are the Supervisor (Manager) of a cybersecurity threat hunting and response team.
+Your goal is to orchestrate the following specialized agents:
+
+1. **ThreatIntel**: Research external threats, CVEs, actor TTPs, and IOC reputation (VirusTotal).
+2. **Hunter**: Search internal logs (Splunk) and endpoint state (Velociraptor).
+3. **RedTeam**: Execute Atomic Red Team tests to simulate attacks. If the user mentions "simulate", "atomic", "T1003", or "attack", YOU MUST CHOOSE THIS AGENT.
 4. **Detection**: Search and manage Sigma detection rules.
+5. **Responder**: Take response actions (block_ip, isolate_host, disable_user). These need human approval. Use ONLY when the user asks for a response action, or when a threat is clearly confirmed by evidence.
 
 **Rules**:
 - You do not execute tools yourself. You delegate to agents.
-- You can chain multiple agents. E.g., RedTeam -> Hunter.
+- You can chain multiple agents. E.g., ThreatIntel -> Hunter -> Responder.
 - When you have enough information to answer the user, or if the task is complete, choose "FINISH".
 - Provide clear, concise instructions to the agents.
 - If the user asks a general question, use ThreatIntel or answer directly if you know (then FINISH).
 
 **Routing Logic**:
-- If the user asks to 'simulate', 'test', 'attack', or run a 'T-code' (like T1003), route to 'RedTeam'.
-- If the user asks to 'search logs', 'find events', 'investigate', route to 'Hunter'.
-- If the user asks to 'research', 'google', 'check virustotal', route to 'Intel'.
-- If the user asks about 'sigma rules', 'detection coverage', route to 'Detection'.
+- 'simulate', 'test', 'attack', or a T-code (like T1003) -> RedTeam
+- 'search logs', 'find events', 'investigate' -> Hunter
+- 'research', 'google', 'check virustotal', 'is this ip malicious' -> ThreatIntel
+- 'sigma rules', 'detection coverage' -> Detection
+- 'block ip', 'isolate host', 'disable user', 'contain', 'respond' -> Responder
+
+**Hunt mode**:
+If the user gives a high-level goal like "hunt for APT29" or "hunt for PowerShell abuse", plan several steps on your own:
+  ThreatIntel (learn the threat's TTPs and IOCs) -> Detection (find related Sigma rules) -> Hunter (search Splunk/Velociraptor for those IOCs) -> FINISH with a clear conclusion.
+Do NOT choose Responder in hunt mode unless the user asked for a response. Only recommend it in your final answer.
 
 **Output Format**:
 You MUST output a valid JSON object matching this schema:
@@ -68,131 +191,132 @@ You MUST output a valid JSON object matching this schema:
   "instructions_for_agent": "Instructions..."
 }}
 """
-    
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="messages"),
-        (
-            "system",
-            "Given the conversation above, who should act next? Return ONLY the JSON object."
-        ),
+        ("system", "Given the conversation above, who should act next? Return ONLY the JSON object."),
     ])
-    
+
     llm = ChatOllama(model=model_name, format="json")
 
     async def supervisor_node(state: AgentState) -> AgentState:
         messages = state["messages"]
-        
-        # Invoke LLM
+
+        # Safety cap: stop endless supervisor loops
+        steps = sum(1 for m in messages if isinstance(m, AIMessage) and str(m.content).startswith("**"))
+        if steps >= MAX_SUPERVISOR_STEPS:
+            print("WARNING: Supervisor step limit reached. Finishing.")
+            return {"next_agent": "FINISH", "instructions": "Step limit reached."}
+
         response = await llm.ainvoke(prompt.format_messages(messages=messages))
         content = response.content
         print(f"DEBUG: Supervisor Raw Output: {content}")
-        
-        # Parse JSON
+
         try:
             data = json.loads(content)
-            # Validate with Pydantic (optional but good for strictness)
-            # output = SupervisorOutput(**data) # strict mode
             next_agent = data.get("next_agent", "FINISH")
             instructions = data.get("instructions_for_agent", "")
-            
-            # Validate next_agent
-            valid_agents = ["ThreatIntel", "Hunter", "RedTeam", "Detection", "FINISH"]
-            if next_agent not in valid_agents:
-                print(f"WARNING: Supervisor hallucinated invalid agent '{next_agent}'. Defaulting to FINISH.")
+
+            if next_agent not in VALID_AGENTS:
+                print(f"WARNING: Supervisor returned invalid agent '{next_agent}'. Defaulting to FINISH.")
                 next_agent = "FINISH"
         except Exception as e:
-            # Fallback if JSON fails
             print(f"Supervisor JSON Parse Error: {e}. Content: {content}")
             next_agent = "FINISH"
             instructions = "Error parsing supervisor decision. Terminating."
 
-        return {
-            "next_agent": next_agent,
-            "instructions": instructions
-        }
+        return {"next_agent": next_agent, "instructions": instructions}
 
     return supervisor_node
 
-# --- Worker Node Helpers ---
+
+# =====================================================================
+# Worker node wrapper
+# =====================================================================
 
 def create_agent_node(agent_name: str, agent_graph):
-    """Wraps a subgraph or chain as a node in the supervisor graph."""
+    """Wraps a worker graph as a node in the supervisor graph."""
     async def agent_node(state: AgentState) -> AgentState:
-        # Pass the global history + instructions to the agent
         instructions = state.get("instructions", "")
         messages = list(state["messages"])
-        
-        # Inject instructions as a system message or user message for the worker
+
         if instructions:
             messages.append(HumanMessage(content=instructions))
-            
-        # Invoke the worker graph
-        # Note: The worker graph should return a dictionary with 'messages'
-        # We assume the worker graph handles its own state and returns a final message
+
         result = await agent_graph.ainvoke({"messages": messages})
-        
-        # Extract new messages generated by the worker
-        # result["messages"] contains [global_history + instructions + new_worker_messages]
-        # We want to return [new_worker_messages] to update the global state
         new_messages = result["messages"][len(messages):]
-        
+
         if not new_messages:
             return {
                 "messages": [AIMessage(content=f"**{agent_name}**: No response.")],
-                "next_agent": "Supervisor"
+                "next_agent": "Supervisor",
             }
 
-        # The last message is the summary/final response
         last_message = new_messages[-1]
-        
-        # Update the content of the last message to include the Agent Name prefix
-        # We create a new AIMessage to avoid mutating the original if it's shared
-        summary_content = f"**{agent_name}**: {last_message.content}"
-        final_message = AIMessage(content=summary_content)
-        
-        # Replace the last message with our prefixed version
-        return_messages = new_messages[:-1] + [final_message]
-        
+        final_message = AIMessage(content=f"**{agent_name}**: {last_message.content}")
         return {
-            "messages": return_messages,
-            "next_agent": "Supervisor" # Return control to supervisor
+            "messages": new_messages[:-1] + [final_message],
+            "next_agent": "Supervisor",
         }
-    
+
     return agent_node
 
-# --- Threat Intel Agent ---
+
+# =====================================================================
+# Threat Intel agent (web + VirusTotal)
+# =====================================================================
+
+def _detect_ioc_type(ioc: str) -> str:
+    ioc = ioc.strip()
+    try:
+        ipaddress.ip_address(ioc)
+        return "ip"
+    except ValueError:
+        pass
+    if re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}", ioc):
+        return "hash"
+    return "url"
+
 
 def build_intel_agent(model_name: str):
-    """Creates the Threat Intel agent subgraph."""
-    # Tools for Intel
-    tools = [web_search, visit_page] # Add check_virustotal if wrapped as LangChain tool
-    
-    # Simple ReAct agent for Intel
-    # We use a system prompt to encourage summarization
+    @tool("check_virustotal")
+    def check_virustotal_ioc(ioc: str) -> str:
+        """Check an IP address, file hash (MD5/SHA1/SHA256) or URL on VirusTotal. Input is the IOC string only."""
+        verdict = policy_check("ThreatIntel", "check_virustotal", ioc)
+        if verdict["decision"] != "allow":
+            return f"POLICY DENIED: {verdict['reason']}"
+        api_key = os.getenv("VT_API_KEY")
+        if not api_key:
+            return "Error: VT_API_KEY is not set"
+        try:
+            result = _vt_check(ioc.strip(), ioc_type=_detect_ioc_type(ioc), api_key=api_key)
+            return json.dumps(result, default=str)[:4000]
+        except Exception as e:
+            return f"Error calling VirusTotal: {e}"
+
+    tools = [web_search, visit_page, check_virustotal_ioc]
+
     system_prompt = """You are a Threat Intelligence Researcher.
 Your goal is to find information about CVEs, Threat Actors, and IOCs.
-Use the available tools to gather information.
+Use the available tools: web_search, visit_page, and check_virustotal (for IP, hash, URL reputation).
 IMPORTANT: After gathering information, you MUST summarize your findings in a clear, concise manner.
 Do not just dump raw data. Explain what it means for the security posture.
+If researching a threat actor, list their main techniques (TTPs) and indicators so the Hunter can search for them.
 """
-    graph = create_react_agent(ChatOllama(model=model_name), tools, prompt=system_prompt)
-    return graph
+    return create_react_agent(ChatOllama(model=model_name), tools, prompt=system_prompt)
 
-# --- Red Team Agent (HITL) ---
+
+# =====================================================================
+# Red Team agent (human approval before it runs)
+# =====================================================================
 
 def build_red_team_agent(model_name: str):
-    """Creates the Red Team agent subgraph."""
-    # Tools
     tools = [AtomicRedTeamTool()]
-    
-    # Custom Red Team Graph to handle model output quirks
-    
+
     async def red_team_node(state: AgentState):
         messages = state["messages"]
-        # Inject detailed system prompt if not present
-        from langchain_core.messages import SystemMessage
-        
+
         system_prompt_text = """You are a Red Team Operator.
 Your goal is to execute Atomic Red Team tests to simulate attacks.
 You have access to a tool called 'atomic_red_team'.
@@ -209,94 +333,56 @@ YOU MUST USE THIS TOOL to execute tests. DO NOT just describe what you would do.
    - Provide the return code and relevant output for each.
    - Do NOT just say "Total tests executed". Show the breakdown.
 """
-        # Check if system prompt is already there (it might be passed from Supervisor instructions)
-        # But we want to enforce OUR prompt.
-        # We'll prepend it as a SystemMessage.
-        
-        # Filter out old system messages if any to avoid confusion
         filtered_messages = [m for m in messages if not isinstance(m, SystemMessage)]
-        
         final_messages = [SystemMessage(content=system_prompt_text)] + filtered_messages
-        
+
         llm = ChatOllama(model=model_name).bind_tools(tools)
         response = await llm.ainvoke(final_messages)
         return {"messages": [response]}
 
+    def _fix_action(args: dict) -> dict:
+        """If action is missing/invalid but technique_id exists, assume execute_test."""
+        action = args.get("action")
+        if (not action or str(action).strip() == "None" or action not in ["execute_test", "list_tests"]) \
+                and "technique_id" in args:
+            args["action"] = "execute_test"
+        return args
+
     async def tool_node(state: AgentState):
         messages = state["messages"]
         last_message = messages[-1]
-        
-        # Check for standard tool calls
+        tool_obj = AtomicRedTeamTool()
+
+        # Standard tool call
         if last_message.tool_calls:
             tool_call = last_message.tool_calls[0]
-            tool = AtomicRedTeamTool()
             args = tool_call["args"]
-            
-            # Fix args mapping
-            # The tool expects 'query' string if called directly via _run, 
-            # but invoke() with dict args maps to _run arguments? 
-            # Actually BaseTool.invoke(dict) passes dict to _run if _run expects dict?
-            # No, BaseTool.invoke handles parsing.
-            # AtomicRedTeamTool._run takes 'query: str'.
-            # If we pass a dict to invoke, it might fail if not handled.
-            # Let's construct the JSON string manually to be safe.
-            
-            # import json  <-- Removed to fix UnboundLocalError
-            
-            with open("/home/achuth/agentic-hunter/debug_redteam.log", "a") as f:
-                f.write(f"DEBUG: Standard Tool Call Args: {args}\n")
+
+            verdict = policy_check("RedTeam", "atomic_red_team", json.dumps(args, default=str))
+            if verdict["decision"] != "allow":
+                return {"messages": [ToolMessage(tool_call_id=tool_call["id"],
+                                                 content=f"POLICY DENIED: {verdict['reason']}")]}
 
             if "query" in args and isinstance(args["query"], str):
-                 # If the model correctly put the JSON string in 'query' arg
-                 query_str = args["query"]
-                 try:
-                     # Try to parse and fix missing action in the JSON string
-                     query_json = json.loads(query_str)
-                     if isinstance(query_json, dict):
-                          action = query_json.get("action")
-                          # Handle None, "None", or missing action, or invalid action string
-                          if (not action or str(action) == "None" or action not in ["execute_test", "list_tests"]) and "technique_id" in query_json:
-                              query_json["action"] = "execute_test"
-                              query_str = json.dumps(query_json)
-                 except:
-                     pass # If not JSON or parse error, pass as is
-                     
-                 result = await run_in_threadpool(tool.invoke, query_str)
+                query_str = args["query"]
+                try:
+                    query_json = json.loads(query_str)
+                    if isinstance(query_json, dict):
+                        query_str = json.dumps(_fix_action(query_json))
+                except Exception:
+                    pass
+                result = await run_in_threadpool(tool_obj.invoke, query_str)
             else:
-                # If model outputted decomposed args
                 action = args.get("query") or args.get("action")
-                
-                # Robustness: If action is missing/invalid but technique_id is present, assume execute_test
-                # Handle None, "None", or missing action
-                
-                with open("/home/achuth/agentic-hunter/debug_redteam.log", "a") as f:
-                    f.write(f"DEBUG: Decomposed Args: {args}, Action: {action}\n")
-
-                if (not action or str(action).strip() == "None" or action not in ["execute_test", "list_tests"]) and "technique_id" in args:
-                    action = "execute_test"
+                if action in ["execute_test", "list_tests"] and not args.get("action"):
                     args["action"] = action
-                    with open("/home/achuth/agentic-hunter/debug_redteam.log", "a") as f:
-                        f.write(f"DEBUG: Injected action (decomposed). New action: {action}\n")
-                
-                if action in ["execute_test", "list_tests"]:
-                    # Ensure 'action' key has a valid value (handle both missing and None)
-                    # Ensure 'action' key has a valid value (handle both missing and None)
-                    current_action = args.get("action")
-                    if not current_action or str(current_action) == "None":
-                        args["action"] = action
-                    
-                    # Reconstruct JSON
-                    json_input = json.dumps(args)
-                    result = await run_in_threadpool(tool.invoke, json_input)
-                else:
-                    # Fallback
-                    result = await run_in_threadpool(tool.invoke, json.dumps(args))
-            
+                args = _fix_action(args)
+                result = await run_in_threadpool(tool_obj.invoke, json.dumps(args))
+
             return {"messages": [ToolMessage(tool_call_id=tool_call["id"], content=str(result))]}
-        
-        # Check for JSON in content (Hallucinated tool call)
+
+        # Model wrote the tool call as JSON text instead of a real tool call
         content = last_message.content.strip()
-        # Strip markdown code blocks if present
         if content.startswith("```json"):
             content = content[7:]
         elif content.startswith("```"):
@@ -307,51 +393,31 @@ YOU MUST USE THIS TOOL to execute tests. DO NOT just describe what you would do.
 
         if content.startswith("{") and ("atomic_red_team" in content or "technique_id" in content):
             try:
-                # Parse the JSON to get args
-                # The tool expects a string input (JSON string)
-                # We can just pass the content directly if it's valid JSON
-                
-                tool = AtomicRedTeamTool()
-                
-                # Parse and fix missing action
-                # Parse and fix missing action
                 try:
                     args = json.loads(content)
                     if isinstance(args, dict):
-                        # Handle nested arguments (e.g. {"name": "...", "arguments": {...}})
                         if "arguments" in args and isinstance(args["arguments"], dict):
                             args = args["arguments"]
-                        
-                        action = args.get("action")
-                        # Handle None, "None", or missing action
-                        if (not action or str(action) == "None") and "technique_id" in args:
-                            args["action"] = "execute_test"
-                        
-                        # Update content with the (potentially extracted and fixed) args
-                        content = json.dumps(args)
-                except:
-                    pass # If parse fails, pass content as is
-                
-                # We pass the JSON string directly
-                result = await run_in_threadpool(tool.invoke, content)
-                
-                # Return HumanMessage for hallucinated calls so the agent sees it as a result to summarize
-                return {"messages": [HumanMessage(content=f"Tool Execution Result: {result}")]}
-                
-                # Return HumanMessage for hallucinated calls so the agent sees it as a result to summarize
+                        content = json.dumps(_fix_action(args))
+                except Exception:
+                    pass
+
+                verdict = policy_check("RedTeam", "atomic_red_team", content)
+                if verdict["decision"] != "allow":
+                    return {"messages": [HumanMessage(content=f"Tool Execution Result: POLICY DENIED: {verdict['reason']}")]}
+
+                result = await run_in_threadpool(tool_obj.invoke, content)
                 return {"messages": [HumanMessage(content=f"Tool Execution Result: {result}")]}
             except Exception as e:
                 print(f"Failed to parse hallucinated tool call: {e}")
-    
+
         return {"messages": []}
 
     def should_continue(state: AgentState):
-        messages = state["messages"]
-        last_message = messages[-1]
+        last_message = state["messages"][-1]
         if last_message.tool_calls:
             return "tools"
-        
-        # Check for hallucinated tool calls
+
         content = last_message.content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -360,101 +426,203 @@ YOU MUST USE THIS TOOL to execute tests. DO NOT just describe what you would do.
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
-        
+
         if content.startswith("{") and ("atomic_red_team" in content or "technique_id" in content):
             return "tools"
-            
         return END
 
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", red_team_node)
     workflow.add_node("tools", tool_node)
-    
     workflow.add_conditional_edges("agent", should_continue, ["tools", END])
     workflow.add_edge("tools", "agent")
-    
     workflow.set_entry_point("agent")
-    
     return workflow.compile()
 
-# --- Detection Agent ---
+
+# =====================================================================
+# Detection agent
+# =====================================================================
 
 def build_detection_agent(model_name: str):
-    """Creates the Detection Engineer agent subgraph."""
-    # Tools
     tools = [SigmaTool()]
-    
     system_prompt = """You are a Detection Engineer.
 Your goal is to find or create detection rules (Sigma, SPL, VQL).
 1. Search for relevant Sigma rules.
 2. Convert them to SPL or VQL if requested.
 3. Provide the rule content or query to the user.
 """
-    graph = create_react_agent(ChatOllama(model=model_name), tools, prompt=system_prompt)
-    return graph
+    return create_react_agent(ChatOllama(model=model_name), tools, prompt=system_prompt)
 
-# --- Hunter Agent ---
+
+# =====================================================================
+# Responder agent (ORCHESTRATION: response actions, simulated)
+# Runs only after human approval (interrupt_before in the main graph).
+# Actions are SIMULATED: they are written to response_actions.jsonl.
+# =====================================================================
+
+RESPONSE_LOG_PATH = os.getenv("RESPONSE_LOG_PATH", "response_actions.jsonl")
+
+
+def _record_response(action: str, target: str, reason: str) -> str:
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "action": action,
+        "target": target,
+        "reason": reason,
+        "mode": "SIMULATED",
+        "status": "executed",
+    }
+    try:
+        with open(RESPONSE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"Response log write failed: {e}")
+    return f"[SIMULATED] {action} executed on {target}. Reason: {reason}. Logged to {RESPONSE_LOG_PATH}."
+
+
+def build_responder_agent(model_name: str):
+    @tool("block_ip")
+    def block_ip(ip: str, reason: str = "Malicious IP") -> str:
+        """Block an IP address at the firewall (simulated). Provide the IP and the reason."""
+        verdict = policy_check("Responder", "block_ip", ip)
+        if verdict["decision"] != "allow":
+            return f"POLICY DENIED: {verdict['reason']}"
+        try:
+            addr = ipaddress.ip_address(ip.strip())
+        except ValueError:
+            return f"POLICY DENIED: '{ip}' is not a valid IP address."
+        if addr.is_loopback or addr.is_private or addr.is_multicast or addr.is_unspecified:
+            _audit({"agent": "Responder", "tool": "block_ip", "payload": ip, "decision": "deny",
+                    "risk": 100, "reason": "protected address range"})
+            return f"POLICY DENIED: {ip} is a private/loopback address and is protected from blocking."
+        return _record_response("block_ip", str(addr), reason)
+
+    @tool("isolate_host")
+    def isolate_host(hostname: str, reason: str = "Suspected compromise") -> str:
+        """Isolate a host from the network (simulated). Provide the hostname and the reason."""
+        verdict = policy_check("Responder", "isolate_host", hostname)
+        if verdict["decision"] != "allow":
+            return f"POLICY DENIED: {verdict['reason']}"
+        if not hostname.strip():
+            return "POLICY DENIED: hostname is empty."
+        return _record_response("isolate_host", hostname.strip(), reason)
+
+    @tool("disable_user")
+    def disable_user(username: str, reason: str = "Suspected account compromise") -> str:
+        """Disable a user account (simulated). Provide the username and the reason."""
+        verdict = policy_check("Responder", "disable_user", username)
+        if verdict["decision"] != "allow":
+            return f"POLICY DENIED: {verdict['reason']}"
+        if username.strip().lower() in PROTECTED_USERS:
+            _audit({"agent": "Responder", "tool": "disable_user", "payload": username, "decision": "deny",
+                    "risk": 100, "reason": "protected account"})
+            return f"POLICY DENIED: '{username}' is a protected account and cannot be disabled."
+        return _record_response("disable_user", username.strip(), reason)
+
+    tools = [block_ip, isolate_host, disable_user]
+
+    system_prompt = """You are a Security Response Engineer (SOAR).
+You take containment actions using these tools: block_ip, isolate_host, disable_user.
+Rules:
+- Act ONLY on targets given in the instructions. Never invent an IP, host, or user.
+- Call exactly the tool that matches the request.
+- If a tool returns POLICY DENIED, do NOT try to bypass it. Explain the denial to the user.
+- After acting, summarize what was done, on which target, and why.
+"""
+    return create_react_agent(ChatOllama(model=model_name), tools, prompt=system_prompt)
+
+
+# =====================================================================
+# Hunter agent (zero trust gate + adaptive retry)
+# =====================================================================
+
+def _is_failed_result(result: Any) -> bool:
+    """True if a tool result is an error or empty, so the Hunter should try again."""
+    text = str(result).strip()
+    if not text or text in ("[]", "{}", "null", "None"):
+        return True
+    low = text.lower()
+    if low.startswith("error") or '"error"' in low[:80]:
+        return True
+    return False
+
+
+def _retry_count_this_task(messages) -> int:
+    """Count [ADAPTIVE] hints since the last instruction given to this agent."""
+    count = 0
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage) and not str(m.content).startswith("Tool Execution Result"):
+            break
+        if "[ADAPTIVE]" in str(getattr(m, "content", "")):
+            count += 1
+    return count
+
 
 def build_hunter_agent(model_name: str, splunk_fn, velociraptor_fn):
-    """
-    Creates the Hunter agent with custom graph to handle tool call quirks.
-    """
-    
-    # Wrap the raw functions as LangChain tools
-    from langchain_core.tools import tool
-    from langchain_core.messages import ToolMessage, AIMessage
+    """Hunter agent: zero trust gated tools + adaptive retry on errors/empty results."""
 
     class SplunkTool(BaseModel):
         query: str = Field(description="The SPL query to execute")
 
+    class VeloTool(BaseModel):
+        query: str = Field(description="The VQL query to execute")
+
     @tool("execute_splunk_search", args_schema=SplunkTool)
     def execute_splunk_search(query: str):
         """Execute a Splunk SPL query to find historical logs."""
-        return splunk_fn(query)
-
-    class VeloTool(BaseModel):
-        query: str = Field(description="The VQL query to execute")
+        return _gated("Hunter", "execute_splunk_search", splunk_fn, query)
 
     @tool("run_velociraptor_query", args_schema=VeloTool)
     def run_velociraptor_query(query: str):
         """Execute a Velociraptor VQL query for live endpoint forensics."""
-        return velociraptor_fn(query)
+        return _gated("Hunter", "run_velociraptor_query", velociraptor_fn, query)
 
     tools = [execute_splunk_search, run_velociraptor_query]
 
+    def _run(name: str, args: dict) -> str:
+        q = (args or {}).get("query")
+        if not q:
+            return "Error: Missing query"
+        if name == "execute_splunk_search":
+            return str(_gated("Hunter", "execute_splunk_search", splunk_fn, q))
+        if name == "run_velociraptor_query":
+            return str(_gated("Hunter", "run_velociraptor_query", velociraptor_fn, q))
+        return "Error: Unknown tool"
+
+    def _with_adaptive_hint(result: str, messages) -> str:
+        """If the result failed or is empty, tell the model to fix the query and retry."""
+        if str(result).startswith("POLICY DENIED"):
+            return result
+        if _is_failed_result(result):
+            tries = _retry_count_this_task(messages)
+            if tries < MAX_ADAPTIVE_RETRIES:
+                return (f"{result}\n[ADAPTIVE] The query failed or returned no data "
+                        f"(attempt {tries + 1} of {MAX_ADAPTIVE_RETRIES}). "
+                        f"Fix or broaden the query (check syntax, index, time range) and try again.")
+            return f"{result}\n[ADAPTIVE] Retry limit reached. Stop and report what you found."
+        return result
+
     async def hunter_node(state: AgentState):
-        messages = state["messages"]
         llm = ChatOllama(model=model_name).bind_tools(tools)
-        response = await llm.ainvoke(messages)
+        response = await llm.ainvoke(state["messages"])
         return {"messages": [response]}
 
     async def tool_node(state: AgentState):
         messages = state["messages"]
         last_message = messages[-1]
-        
-        # Check for standard tool calls
+
+        # Standard tool calls
         if last_message.tool_calls:
             results = []
             for tool_call in last_message.tool_calls:
-                t_name = tool_call["name"]
-                t_args = tool_call["args"]
-                
-                result = "Error: Unknown tool"
-                if t_name == "execute_splunk_search":
-                    q = t_args.get("query")
-                    if q: result = splunk_fn(q)
-                    else: result = "Error: Missing query"
-                elif t_name == "run_velociraptor_query":
-                    q = t_args.get("query")
-                    if q: result = velociraptor_fn(q)
-                    else: result = "Error: Missing query"
-                
-                results.append(ToolMessage(tool_call_id=tool_call["id"], content=str(result)))
+                raw = await run_in_threadpool(_run, tool_call["name"], tool_call["args"])
+                content = _with_adaptive_hint(raw, messages)
+                results.append(ToolMessage(tool_call_id=tool_call["id"], content=str(content)))
             return {"messages": results}
 
-        # Check for JSON in content (Hallucinated tool call)
+        # Model wrote the tool call as JSON text instead of a real tool call
         content = last_message.content.strip()
-        # Strip markdown code blocks if present
         if content.startswith("```json"):
             content = content[7:]
         elif content.startswith("```"):
@@ -465,35 +633,26 @@ def build_hunter_agent(model_name: str, splunk_fn, velociraptor_fn):
 
         if content.startswith("{") and ("execute_splunk_search" in content or "run_velociraptor_query" in content):
             try:
-                import json
                 data = json.loads(content)
-                name = data.get("name")
-                args = data.get("arguments", {})
-                
-                result = "Error: Unknown tool"
-                if name == "execute_splunk_search":
-                    q = args.get("query")
-                    if q: result = splunk_fn(q)
-                    else: result = "Error: Missing query"
-                elif name == "run_velociraptor_query":
-                    q = args.get("query")
-                    if q: result = velociraptor_fn(q)
-                    else: result = "Error: Missing query"
-                
-                # Return HumanMessage for hallucinated calls so the agent sees it as a result to summarize
+                raw = await run_in_threadpool(_run, data.get("name"), data.get("arguments", {}))
+                result = _with_adaptive_hint(raw, messages)
                 return {"messages": [HumanMessage(content=f"Tool Execution Result: {result}")]}
             except Exception as e:
                 print(f"Failed to parse hallucinated tool call: {e}")
-        
+
         return {"messages": []}
 
     def should_continue(state: AgentState):
         messages = state["messages"]
         last_message = messages[-1]
+
+        # Stop if retry limit is reached
+        if _retry_count_this_task(messages) > MAX_ADAPTIVE_RETRIES:
+            return END
+
         if last_message.tool_calls:
             return "tools"
-        
-        # Check for hallucinated tool calls
+
         content = last_message.content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -502,25 +661,23 @@ def build_hunter_agent(model_name: str, splunk_fn, velociraptor_fn):
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
-        
+
         if content.startswith("{") and ("execute_splunk_search" in content or "run_velociraptor_query" in content):
             return "tools"
-            
         return END
 
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", hunter_node)
     workflow.add_node("tools", tool_node)
-    
     workflow.add_conditional_edges("agent", should_continue, ["tools", END])
     workflow.add_edge("tools", "agent")
-    
     workflow.set_entry_point("agent")
-    
     return workflow.compile()
 
 
-# --- Main Graph Construction ---
+# =====================================================================
+# Main graph
+# =====================================================================
 
 def build_hierarchical_graph(
     splunk_execute_fn: Any,
@@ -528,37 +685,25 @@ def build_hierarchical_graph(
     supervisor_model: str,
     worker_model: str,
 ):
-    # Build Worker Agents
     intel_agent = build_intel_agent(worker_model)
     red_team_agent = build_red_team_agent(worker_model)
     detection_agent = build_detection_agent(worker_model)
-    
-    # Hunter needs the execution functions
-    # We need to ensure these functions are compatible with the tool wrappers
-    # For now, we assume they are synchronous or we wrap them.
-    # If they are async, we might need `async_tool`.
+    responder_agent = build_responder_agent(worker_model)
     hunter_agent = build_hunter_agent(worker_model, splunk_execute_fn, velociraptor_fn)
 
-    # Build Supervisor
     supervisor_node = build_supervisor_node(supervisor_model)
 
-    # Create Graph
     graph = StateGraph(AgentState)
-    
-    print(f"DEBUG: intel_agent type: {type(intel_agent)}")
-    intel_node = create_agent_node("ThreatIntel", intel_agent)
-    print(f"DEBUG: intel_node type: {type(intel_node)}")
 
     graph.add_node("Supervisor", supervisor_node)
-    graph.add_node("ThreatIntel", intel_node)
+    graph.add_node("ThreatIntel", create_agent_node("ThreatIntel", intel_agent))
     graph.add_node("Hunter", create_agent_node("Hunter", hunter_agent))
     graph.add_node("RedTeam", create_agent_node("RedTeam", red_team_agent))
     graph.add_node("Detection", create_agent_node("Detection", detection_agent))
+    graph.add_node("Responder", create_agent_node("Responder", responder_agent))
 
-    # Edges
     graph.add_edge(START, "Supervisor")
-    
-    # Conditional Edges from Supervisor
+
     def route_supervisor(state: AgentState):
         next_node = state["next_agent"]
         if next_node == "FINISH":
@@ -573,24 +718,15 @@ def build_hierarchical_graph(
             "Hunter": "Hunter",
             "RedTeam": "RedTeam",
             "Detection": "Detection",
-            END: END
-        }
+            "Responder": "Responder",
+            END: END,
+        },
     )
 
-    # Workers always return to Supervisor
-    graph.add_edge("ThreatIntel", "Supervisor")
-    graph.add_edge("Hunter", "Supervisor")
-    graph.add_edge("RedTeam", "Supervisor")
-    graph.add_edge("Detection", "Supervisor")
+    # Workers always return to the Supervisor
+    for worker in ["ThreatIntel", "Hunter", "RedTeam", "Detection", "Responder"]:
+        graph.add_edge(worker, "Supervisor")
 
-    # Compile with Interrupts for HITL
-    # We want to interrupt BEFORE the RedTeam agent executes.
-    # Since "RedTeam" node wraps the agent, interrupting before "RedTeam" means 
-    # the supervisor has decided to call it, but it hasn't run yet.
-    # This gives the user a chance to approve "next_agent": "RedTeam".
-    
-    # IMPORTANT: interrupt_before requires a checkpointer
+    # Human-in-the-loop: pause BEFORE risky agents so the user can approve or deny.
     checkpointer = MemorySaver()
-    return graph.compile(interrupt_before=["RedTeam"], checkpointer=checkpointer)
-
-
+    return graph.compile(interrupt_before=["RedTeam", "Responder"], checkpointer=checkpointer)
