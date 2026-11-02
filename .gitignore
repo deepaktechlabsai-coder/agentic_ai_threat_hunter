@@ -1,6 +1,7 @@
 # Python virtual environment
 hunter_env/
 .venv/
+venv/
 
 # Secrets and credentials
 .env
